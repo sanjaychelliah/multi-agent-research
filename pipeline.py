@@ -52,10 +52,55 @@ class PipelineResult:
 
 
 def _build_llm():
-    if cfg.LLM_PROVIDER == "anthropic":
+    """Instantiate the LLM based on LLM_PROVIDER env var.
+
+    Supported providers:
+      openai      — OpenAI API (default)
+      anthropic   — Anthropic API (Claude models)
+      openrouter  — OpenRouter (any model via OpenAI-compatible API)
+      ollama      — Local Ollama instance (OpenAI-compatible API)
+    """
+    provider = cfg.LLM_PROVIDER
+
+    if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore
-        return ChatAnthropic(model=cfg.LLM_MODEL, api_key=cfg.ANTHROPIC_API_KEY)  # type: ignore
-    return ChatOpenAI(model=cfg.LLM_MODEL, api_key=cfg.OPENAI_API_KEY, temperature=0.2)
+        return ChatAnthropic(  # type: ignore
+            model=cfg.LLM_MODEL,
+            api_key=cfg.ANTHROPIC_API_KEY,
+            temperature=0.2,
+        )
+
+    if provider == "openrouter":
+        # OpenRouter uses the OpenAI wire format with a different base URL.
+        # Pass your OPENROUTER_API_KEY as the api_key.
+        return ChatOpenAI(
+            model=cfg.LLM_MODEL,
+            api_key=cfg.OPENROUTER_API_KEY,
+            base_url=cfg.OPENROUTER_BASE_URL,
+            temperature=0.2,
+            default_headers={
+                # OpenRouter recommends these headers for tracking / rate-limiting
+                "HTTP-Referer": "https://github.com/multi-agent-research",
+                "X-Title": "Multi-Agent Research Assistant",
+            },
+        )
+
+    if provider == "ollama":
+        # Ollama exposes an OpenAI-compatible endpoint at /v1.
+        # No real API key is needed — pass a dummy string.
+        return ChatOpenAI(
+            model=cfg.LLM_MODEL,          # e.g. "llama3.2", "mistral", "qwen2.5"
+            api_key="ollama",             # required by the client but ignored by Ollama
+            base_url=cfg.OLLAMA_BASE_URL,
+            temperature=0.2,
+        )
+
+    # Default: OpenAI
+    return ChatOpenAI(
+        model=cfg.LLM_MODEL,
+        api_key=cfg.OPENAI_API_KEY,
+        temperature=0.2,
+    )
 
 
 async def run_pipeline(query: str, store: MetricsStore | None = None) -> PipelineResult:
