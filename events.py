@@ -41,19 +41,24 @@ class AgentFinished(BaseEvent):
 @dataclass
 class LLMCallStarted(BaseEvent):
     event_type: str = "llm_call_started"
+    call_id: str = ""           # uuid4 — pairs this with its LLMCallFinished
     agent_name: str = ""
     model: str = ""
-    prompt_preview: str = ""    # first ~100 chars of the human turn
+    prompt_preview: str = ""    # first ~120 chars of the human turn (for the feed summary)
+    full_messages: list = field(default_factory=list)
+    # ^ [{role: "system"|"human"|"ai", content: str}, ...]
 
 
 @dataclass
 class LLMCallFinished(BaseEvent):
     event_type: str = "llm_call_finished"
+    call_id: str = ""           # matches the LLMCallStarted with the same call_id
     agent_name: str = ""
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: float = 0.0
     cost_usd: float = 0.0
+    response_text: str = ""     # full LLM output text
 
 
 @dataclass

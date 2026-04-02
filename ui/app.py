@@ -87,10 +87,12 @@ def format_event_md(event: BaseEvent) -> str:
             f"· {event.tokens:,} tokens · {event.latency_ms:.0f} ms · {cost}"
         )
 
+    # LLM events are rendered by render_llm_call_block(), not as plain markdown.
+    # These branches are kept as a text-only fallback (e.g. for the CLI).
     if isinstance(event, LLMCallStarted):
         preview = event.prompt_preview[:100] + "…" if len(event.prompt_preview) > 100 else event.prompt_preview
         return (
-            f"`{ts}` {icon} **LLM call** `{event.agent_name}` · `{event.model}`  \n"
+            f"`{ts}` 🧠 **LLM call** `{event.agent_name}` · `{event.model}`  \n"
             f"&nbsp;&nbsp;&nbsp;&nbsp;*\"{preview}\"*"
         )
 
@@ -127,6 +129,108 @@ def format_event_md(event: BaseEvent) -> str:
         return f"`{ts}` ❌ **Pipeline failed** — {event.error}"
 
     return f"`{ts}` {icon} `{event.event_type}`"
+
+
+def render_llm_call_block(
+    started: LLMCallStarted,
+    finished: LLMCallFinished | None,
+) -> None:
+    """
+    Render one LLM call as a single st.expander widget.
+
+    - While the pipeline is still running (finished is None): show a
+      condensed 'in progress' line with the prompt preview but no expander.
+    - Once finished: show the summary line as the expander label, and
+      inside it show full input messages and the response in two tabs.
+    """
+    ts = _ts(started)
+
+    if finished is None:
+        # Still waiting for the response — show a minimal progress line
+        preview = (
+            started.prompt_preview[:90] + "…"
+            if len(started.prompt_preview) > 90
+            else started.prompt_preview
+        )
+        st.markdown(
+            f"`{ts}` 🧠 **LLM call** `{started.agent_name}` · *waiting for response…*  \n"
+            f"&nbsp;&nbsp;&nbsp;&nbsp;*\"{preview}\"*",
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Build the expander label (summary line)
+    cost = f"${finished.cost_usd:.5f}" if finished.cost_usd else "—"
+    label = (
+        f"`{ts}` 🧠 **LLM call** · `{started.agent_name}` · `{started.model}` · "
+        f"{finished.prompt_tokens}↑ {finished.completion_tokens}↓ tokens · "
+        f"{finished.latency_ms:.0f} ms · {cost}"
+    )
+
+    with st.expander(label, expanded=False):
+        in_tab, out_tab = st.tabs(["📥 Input messages", "📤 Response"])
+
+        with in_tab:
+            if started.full_messages:
+                for msg in started.full_messages:
+                    role = msg.get("role", "unknown").capitalize()
+                    content = msg.get("content", "")
+                    # Colour-code the role badge
+                    badge_color = {
+                        "System": "#6366f1",
+                        "Human": "#0ea5e9",
+                        "Assistant": "#10b981",
+                    }.get(role, "#64748b")
+                    st.markdown(
+                        f"<span style='background:{badge_color};color:white;"
+                        f"padding:2px 8px;border-radius:4px;font-size:0.8em;"
+                        f"font-weight:600'>{role}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.code(content, language="text")
+            else:
+                st.caption("No messages captured.")
+
+        with out_tab:
+            if finished.response_text:
+                st.code(finished.response_text, language="text")
+            else:
+                st.caption("No response text captured.")
+
+
+def build_llm_call_index(events: list[BaseEvent]) -> dict[str, LLMCallFinished | None]:
+    """
+    Pre-scan the event list and return a dict mapping each call_id
+    to its LLMCallFinished event (or None if not yet received).
+    """
+    index: dict[str, LLMCallFinished | None] = {}
+    for e in events:
+        if isinstance(e, LLMCallStarted):
+            if e.call_id not in index:
+                index[e.call_id] = None
+        elif isinstance(e, LLMCallFinished):
+            index[e.call_id] = e
+    return index
+
+
+def render_feed(events: list[BaseEvent]) -> None:
+    """
+    Render the activity feed.
+
+    LLMCallStarted events are rendered as expandable blocks (paired with
+    their matching LLMCallFinished by call_id). Every other event is
+    rendered as a plain markdown line.  LLMCallFinished events are skipped
+    here because they are consumed inside their Started block.
+    """
+    llm_index = build_llm_call_index(events)
+
+    for event in events:
+        if isinstance(event, LLMCallStarted):
+            render_llm_call_block(event, llm_index.get(event.call_id))
+        elif isinstance(event, LLMCallFinished):
+            pass  # already rendered inside its LLMCallStarted block
+        else:
+            st.markdown(format_event_md(event), unsafe_allow_html=True)
 
 
 def agent_status_card(container, agent_id: str, state: str, metrics: dict) -> None:
@@ -342,11 +446,11 @@ if page == "🔬 Research":
 
         # Live activity feed
         st.markdown("#### Live Activity Feed")
+        st.caption("🧠 LLM calls are expandable — click to see full prompts & responses.")
         feed_container = st.container(border=True)
         with feed_container:
-            events_to_show = st.session_state.all_events[-80:]  # cap display
-            for event in events_to_show:
-                st.markdown(format_event_md(event), unsafe_allow_html=True)
+            events_to_show = st.session_state.all_events[-120:]  # cap display
+            render_feed(events_to_show)
 
             if st.session_state.running:
                 st.markdown("*⏳ Pipeline running…*")

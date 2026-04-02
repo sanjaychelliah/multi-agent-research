@@ -157,7 +157,8 @@ class LangChainMetricsCallback(BaseCallbackHandler):
     """
     LangChain callback that:
       1. Populates AgentMetrics on each LLM call (tokens, cost, latency)
-      2. Emits LLMCallStarted / LLMCallFinished events to the EventQueue
+      2. Emits LLMCallStarted / LLMCallFinished events to the EventQueue,
+         including full prompt messages and response text for the UI expander
     """
 
     def __init__(
@@ -172,11 +173,34 @@ class LangChainMetricsCallback(BaseCallbackHandler):
         self.model = model
         self.event_queue = event_queue
         self.agent_name = agent_name
-        self._llm_start_time: float = 0.0
+        # Stack of (call_id, start_time) — supports nested calls
+        self._call_stack: list[tuple[str, float]] = []
 
     def _emit(self, event: Any) -> None:
         if self.event_queue is not None:
             self.event_queue.put(event)
+
+    @staticmethod
+    def _role_of(msg: BaseMessage) -> str:
+        cls = type(msg).__name__.lower()
+        if "system" in cls:
+            return "system"
+        if "human" in cls or "user" in cls:
+            return "human"
+        if "ai" in cls or "assistant" in cls:
+            return "assistant"
+        return cls.replace("message", "").strip() or "unknown"
+
+    @staticmethod
+    def _content_str(msg: BaseMessage) -> str:
+        c = msg.content
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            # Some providers return content as [{type: "text", text: "..."}]
+            parts = [p.get("text", "") for p in c if isinstance(p, dict)]
+            return "\n".join(parts)
+        return str(c)
 
     # ── Chat model (ChatOpenAI, ChatAnthropic, etc.) ──────────────────────────
 
@@ -187,24 +211,29 @@ class LangChainMetricsCallback(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         from events import LLMCallStarted
+
         self.metrics.llm_calls += 1
         self.metrics.start_timer()
-        self._llm_start_time = time.perf_counter()
+        call_id = str(uuid.uuid4())
+        self._call_stack.append((call_id, time.perf_counter()))
 
-        # Extract last human message as preview
+        # Build full_messages and extract preview from last human turn
+        full_messages: list[dict] = []
         preview = ""
         for batch in messages:
-            for msg in reversed(batch):
-                if hasattr(msg, "content") and isinstance(msg.content, str):
-                    preview = msg.content[:120].replace("\n", " ")
-                    break
-            if preview:
-                break
+            for msg in batch:
+                role = self._role_of(msg)
+                content = self._content_str(msg)
+                full_messages.append({"role": role, "content": content})
+                if role == "human" and not preview:
+                    preview = content[:120].replace("\n", " ")
 
         self._emit(LLMCallStarted(
+            call_id=call_id,
             agent_name=self.agent_name,
             model=self.model,
             prompt_preview=preview,
+            full_messages=full_messages,
         ))
 
     # ── Completion model fallback ─────────────────────────────────────────────
@@ -216,21 +245,29 @@ class LangChainMetricsCallback(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         from events import LLMCallStarted
+
         self.metrics.llm_calls += 1
         self.metrics.start_timer()
-        self._llm_start_time = time.perf_counter()
+        call_id = str(uuid.uuid4())
+        self._call_stack.append((call_id, time.perf_counter()))
 
+        full_messages = [{"role": "human", "content": p} for p in prompts]
         preview = prompts[0][:120].replace("\n", " ") if prompts else ""
+
         self._emit(LLMCallStarted(
+            call_id=call_id,
             agent_name=self.agent_name,
             model=self.model,
             prompt_preview=preview,
+            full_messages=full_messages,
         ))
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         from events import LLMCallFinished
+
         self.metrics.stop_timer()
-        elapsed_ms = (time.perf_counter() - self._llm_start_time) * 1000
+        call_id, start_time = self._call_stack.pop() if self._call_stack else ("", 0.0)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         usage = response.llm_output or {}
         token_usage = usage.get("token_usage", {})
@@ -243,10 +280,23 @@ class LangChainMetricsCallback(BaseCallbackHandler):
         call_cost = estimate_cost(self.model, pt, ct)
         self.metrics.cost_usd += call_cost
 
+        # Extract response text from generations
+        response_text = ""
+        try:
+            gen = response.generations[0][0]
+            if hasattr(gen, "message"):
+                response_text = self._content_str(gen.message)
+            elif hasattr(gen, "text"):
+                response_text = gen.text
+        except (IndexError, AttributeError):
+            pass
+
         self._emit(LLMCallFinished(
+            call_id=call_id,
             agent_name=self.agent_name,
             prompt_tokens=pt,
             completion_tokens=ct,
             latency_ms=elapsed_ms,
             cost_usd=call_cost,
+            response_text=response_text,
         ))
