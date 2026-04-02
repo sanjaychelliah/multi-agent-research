@@ -4,12 +4,15 @@ Search Agent
 Receives web_search TaskCards from the orchestrator via the A2A bus.
 Uses the MCP search server tool to fetch results, stores them in the
 MCP memory server, and dispatches results to the summarizer.
+
+Emits ToolCallStarted / ToolCallFinished events for each MCP tool call.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -44,7 +47,6 @@ class SearchAgent(BaseAgent):
         self._results: list[dict[str, Any]] = []
         self._pending_tasks: list[A2AMessage] = []
 
-        # Register on the bus
         bus.subscribe(self.agent_id, self._handle_message)
 
     async def _handle_message(self, message: A2AMessage) -> None:
@@ -54,56 +56,88 @@ class SearchAgent(BaseAgent):
 
     async def run(self) -> list[dict[str, Any]]:
         """Process all queued search tasks, return aggregated results."""
-        # Small yield to allow bus dispatches to complete
-        await asyncio.sleep(0)
+        async with self._tracked_run("🔍 Search Agent"):
+            from events import ToolCallStarted, ToolCallFinished
 
-        tasks = list(self._pending_tasks)
-        self._pending_tasks.clear()
+            # Small yield to allow bus dispatches to complete
+            await asyncio.sleep(0)
 
-        for msg in tasks:
-            self._metrics.start_timer()
-            task_input = msg.task.input
-            query = task_input["query"]
+            tasks = list(self._pending_tasks)
+            self._pending_tasks.clear()
 
-            try:
-                raw = await self.search_tool.ainvoke({"query": query})
-                if isinstance(raw, str):
-                    parsed = json.loads(raw)
-                    results = parsed if isinstance(parsed, list) else []
-                elif isinstance(raw, list):
-                    results = raw
-                else:
+            for msg in tasks:
+                self._metrics.start_timer()
+                task_input = msg.task.input
+                query = task_input["query"]
+
+                # ── web_search MCP tool call ──────────────────────────────────
+                self._emit(ToolCallStarted(
+                    agent_name=self.agent_id,
+                    tool_name="web_search",
+                    input_preview=f'query="{query}"',
+                ))
+                t0 = time.perf_counter()
+
+                try:
+                    raw = await self.search_tool.ainvoke({"query": query})
+                    if isinstance(raw, str):
+                        parsed = json.loads(raw)
+                        results = parsed if isinstance(parsed, list) else []
+                    elif isinstance(raw, list):
+                        results = raw
+                    else:
+                        results = []
+                except Exception:
                     results = []
-            except Exception:
-                results = []
 
-            self._metrics.stop_timer()
+                search_ms = (time.perf_counter() - t0) * 1000
+                self._metrics.stop_timer()
 
-            # Store in MCP memory
-            mem_key = f"search_results_task_{task_input['subtask_id']}"
-            try:
-                await self.memory_write_tool.ainvoke({"key": mem_key, "value": json.dumps(results)})
-            except Exception:
-                pass  # memory storage is best-effort
+                self._emit(ToolCallFinished(
+                    agent_name=self.agent_id,
+                    tool_name="web_search",
+                    result_count=len(results),
+                    latency_ms=search_ms,
+                ))
 
-            result_payload = {
-                "subtask_id": task_input["subtask_id"],
-                "query": query,
-                "rationale": task_input.get("rationale", ""),
-                "results": results,
-                "memory_key": mem_key,
-            }
-            self._results.append(result_payload)
+                # ── memory_write MCP tool call ────────────────────────────────
+                mem_key = f"search_results_task_{task_input['subtask_id']}"
+                self._emit(ToolCallStarted(
+                    agent_name=self.agent_id,
+                    tool_name="memory_write",
+                    input_preview=f'key="{mem_key}"',
+                ))
+                t1 = time.perf_counter()
+                try:
+                    await self.memory_write_tool.ainvoke({"key": mem_key, "value": json.dumps(results)})
+                except Exception:
+                    pass
+                mem_ms = (time.perf_counter() - t1) * 1000
+                self._emit(ToolCallFinished(
+                    agent_name=self.agent_id,
+                    tool_name="memory_write",
+                    result_count=1,
+                    latency_ms=mem_ms,
+                ))
 
-            # Forward to summarizer via A2A
-            reply = A2AMessage(
-                sender=self.agent_id,
-                receiver="summarizer_agent",
-                task=TaskCard(
-                    task_type="summarize",
-                    input=result_payload,
-                ),
-            )
-            await self.bus.publish(reply)
+                result_payload = {
+                    "subtask_id": task_input["subtask_id"],
+                    "query": query,
+                    "rationale": task_input.get("rationale", ""),
+                    "results": results,
+                    "memory_key": mem_key,
+                }
+                self._results.append(result_payload)
+
+                # Forward to summarizer via A2A
+                reply = A2AMessage(
+                    sender=self.agent_id,
+                    receiver="summarizer_agent",
+                    task=TaskCard(
+                        task_type="summarize",
+                        input=result_payload,
+                    ),
+                )
+                await self.bus.publish(reply)
 
         return self._results

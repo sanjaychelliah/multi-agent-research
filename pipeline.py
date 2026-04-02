@@ -24,9 +24,11 @@ Flow:
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_mcp_adapters.sessions import StdioConnection
 from langchain_mcp_adapters.tools import load_mcp_tools
@@ -36,6 +38,9 @@ from a2a import MessageBus
 from agents import CriticAgent, OrchestratorAgent, SearchAgent, SummarizerAgent
 from config import cfg
 from metrics import MetricsStore, MetricsTracker
+
+if TYPE_CHECKING:
+    from events import EventQueue
 
 
 @dataclass
@@ -71,26 +76,21 @@ def _build_llm():
         )
 
     if provider == "openrouter":
-        # OpenRouter uses the OpenAI wire format with a different base URL.
-        # Pass your OPENROUTER_API_KEY as the api_key.
         return ChatOpenAI(
             model=cfg.LLM_MODEL,
             api_key=cfg.OPENROUTER_API_KEY,
             base_url=cfg.OPENROUTER_BASE_URL,
             temperature=0.2,
             default_headers={
-                # OpenRouter recommends these headers for tracking / rate-limiting
                 "HTTP-Referer": "https://github.com/multi-agent-research",
                 "X-Title": "Multi-Agent Research Assistant",
             },
         )
 
     if provider == "ollama":
-        # Ollama exposes an OpenAI-compatible endpoint at /v1.
-        # No real API key is needed — pass a dummy string.
         return ChatOpenAI(
-            model=cfg.LLM_MODEL,          # e.g. "llama3.2", "mistral", "qwen2.5"
-            api_key="ollama",             # required by the client but ignored by Ollama
+            model=cfg.LLM_MODEL,
+            api_key="ollama",
             base_url=cfg.OLLAMA_BASE_URL,
             temperature=0.2,
         )
@@ -103,12 +103,16 @@ def _build_llm():
     )
 
 
-async def run_pipeline(query: str, store: MetricsStore | None = None) -> PipelineResult:
+async def run_pipeline(
+    query: str,
+    store: MetricsStore | None = None,
+    event_queue: "EventQueue | None" = None,
+) -> PipelineResult:
     """Execute the full multi-agent research pipeline for a given query."""
     cfg.validate()
 
-    tracker = MetricsTracker(query=query, model=cfg.LLM_MODEL)
-    bus = MessageBus()
+    tracker = MetricsTracker(query=query, model=cfg.LLM_MODEL, event_queue=event_queue)
+    bus = MessageBus(event_queue=event_queue)
     llm = _build_llm()
 
     # ── Connect to MCP Servers via StdioConnection ────────────────────────────
@@ -126,7 +130,6 @@ async def run_pipeline(query: str, store: MetricsStore | None = None) -> Pipelin
     memory_tools = await load_mcp_tools(None, connection=memory_connection)
     search_tools = await load_mcp_tools(None, connection=search_connection)
 
-    # Find specific tools by name
     search_tool = next(t for t in search_tools if t.name == "web_search")
     memory_write_tool = next(t for t in memory_tools if t.name == "memory_write")
 
@@ -155,7 +158,7 @@ async def run_pipeline(query: str, store: MetricsStore | None = None) -> Pipelin
     if store:
         store.save(run_metrics)
 
-    return PipelineResult(
+    result = PipelineResult(
         query=query,
         plan=plan,
         search_results=search_results,
@@ -166,3 +169,39 @@ async def run_pipeline(query: str, store: MetricsStore | None = None) -> Pipelin
         metrics=run_metrics.to_dict(),
         a2a_log=bus.log_as_dicts(),
     )
+
+    # Signal the UI that the pipeline is done
+    if event_queue is not None:
+        from events import PipelineFinished
+        event_queue.put(PipelineFinished(success=True))
+
+    return result
+
+
+def run_pipeline_threaded(
+    query: str,
+    result_holder: list,          # mutable list; result appended as ("ok"|"error", data)
+    store: MetricsStore | None = None,
+    event_queue: "EventQueue | None" = None,
+) -> threading.Thread:
+    """
+    Run the pipeline in a background daemon thread.
+
+    The caller passes an empty list as result_holder; when the thread
+    finishes it appends either ("ok", PipelineResult) or ("error", str).
+
+    Returns the started Thread so the caller can join or check is_alive().
+    """
+    def _target():
+        try:
+            result = asyncio.run(run_pipeline(query, store=store, event_queue=event_queue))
+            result_holder.append(("ok", result))
+        except Exception as exc:
+            result_holder.append(("error", str(exc)))
+            if event_queue is not None:
+                from events import PipelineFinished
+                event_queue.put(PipelineFinished(success=False, error=str(exc)))
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    return thread

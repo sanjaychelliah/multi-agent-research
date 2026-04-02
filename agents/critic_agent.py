@@ -74,43 +74,45 @@ class CriticAgent(BaseAgent):
             self._pending.append(message)
 
     async def run(self) -> dict[str, Any]:
-        await asyncio.sleep(0)
-        tasks = list(self._pending)
-        self._pending.clear()
+        async with self._tracked_run("⚖️ Critic"):
+            await asyncio.sleep(0)
+            tasks = list(self._pending)
+            self._pending.clear()
 
-        if not tasks:
-            return {"error": "No summaries received for critique."}
+            if not tasks:
+                self.result = {"error": "No summaries received for critique."}
+                return self.result
 
-        # Merge summaries from all messages
-        all_summaries: list[dict] = []
-        for msg in tasks:
-            all_summaries.extend(msg.task.input.get("summaries", []))
+            # Merge summaries from all messages
+            all_summaries: list[dict] = []
+            for msg in tasks:
+                all_summaries.extend(msg.task.input.get("summaries", []))
 
-        self._metrics.start_timer()
+            self._metrics.start_timer()
 
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"Summaries to critique and synthesize:\n\n{json.dumps(all_summaries, indent=2)}"),
-        ]
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=f"Summaries to critique and synthesize:\n\n{json.dumps(all_summaries, indent=2)}"),
+            ]
 
-        callback = self.tracker.make_callback("critic_agent")
-        response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
-        self._metrics.stop_timer()
+            callback = self.tracker.make_callback("critic_agent")
+            response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
+            self._metrics.stop_timer()
 
-        try:
-            self.result = json.loads(response.content)
-        except json.JSONDecodeError:
-            self.result = {
-                "critique": {"gaps": [], "contradictions": [], "strengths": []},
-                "final_report": {
-                    "title": "Research Report",
-                    "executive_summary": response.content,
-                    "sections": [],
-                    "key_takeaways": [],
-                    "all_sources": [],
-                },
-                "confidence_score": 0.5,
-                "confidence_rationale": "Could not parse structured output.",
-            }
+            try:
+                self.result = json.loads(response.content)
+            except json.JSONDecodeError:
+                self.result = {
+                    "critique": {"gaps": [], "contradictions": [], "strengths": []},
+                    "final_report": {
+                        "title": "Research Report",
+                        "executive_summary": response.content,
+                        "sections": [],
+                        "key_takeaways": [],
+                        "all_sources": [],
+                    },
+                    "confidence_score": 0.5,
+                    "confidence_rationale": "Could not parse structured output.",
+                }
 
         return self.result

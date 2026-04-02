@@ -62,53 +62,54 @@ class SummarizerAgent(BaseAgent):
             self._pending.append(message)
 
     async def run(self) -> list[dict[str, Any]]:
-        await asyncio.sleep(0)
-        tasks = list(self._pending)
-        self._pending.clear()
+        async with self._tracked_run("📝 Summarizer"):
+            await asyncio.sleep(0)
+            tasks = list(self._pending)
+            self._pending.clear()
 
-        for msg in tasks:
-            self._metrics.start_timer()
-            task_input = msg.task.input
+            for msg in tasks:
+                self._metrics.start_timer()
+                task_input = msg.task.input
 
-            results_text = json.dumps(task_input.get("results", []), indent=2)
-            user_content = (
-                f"Query: {task_input['query']}\n\n"
-                f"Rationale: {task_input.get('rationale', '')}\n\n"
-                f"Search Results:\n{results_text}"
-            )
+                results_text = json.dumps(task_input.get("results", []), indent=2)
+                user_content = (
+                    f"Query: {task_input['query']}\n\n"
+                    f"Rationale: {task_input.get('rationale', '')}\n\n"
+                    f"Search Results:\n{results_text}"
+                )
 
-            messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=user_content),
-            ]
+                messages = [
+                    SystemMessage(content=SYSTEM_PROMPT),
+                    HumanMessage(content=user_content),
+                ]
 
-            callback = self.tracker.make_callback("summarizer_agent")
-            response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
-            self._metrics.stop_timer()
+                callback = self.tracker.make_callback("summarizer_agent")
+                response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
+                self._metrics.stop_timer()
 
-            try:
-                summary = json.loads(response.content)
-            except json.JSONDecodeError:
-                summary = {
-                    "subtask_id": task_input.get("subtask_id", 0),
-                    "query": task_input["query"],
-                    "key_findings": [],
-                    "summary": response.content,
-                    "sources": [],
-                }
+                try:
+                    summary = json.loads(response.content)
+                except json.JSONDecodeError:
+                    summary = {
+                        "subtask_id": task_input.get("subtask_id", 0),
+                        "query": task_input["query"],
+                        "key_findings": [],
+                        "summary": response.content,
+                        "sources": [],
+                    }
 
-            self._summaries.append(summary)
+                self._summaries.append(summary)
 
-        # Forward all summaries to critic in one shot
-        if self._summaries:
-            msg = A2AMessage(
-                sender=self.agent_id,
-                receiver="critic_agent",
-                task=TaskCard(
-                    task_type="critique",
-                    input={"summaries": self._summaries},
-                ),
-            )
-            await self.bus.publish(msg)
+            # Forward all summaries to critic in one shot
+            if self._summaries:
+                msg = A2AMessage(
+                    sender=self.agent_id,
+                    receiver="critic_agent",
+                    task=TaskCard(
+                        task_type="critique",
+                        input={"summaries": self._summaries},
+                    ),
+                )
+                await self.bus.publish(msg)
 
         return self._summaries

@@ -57,41 +57,37 @@ class OrchestratorAgent(BaseAgent):
 
     async def run(self, query: str) -> dict:
         """Break query into subtasks and dispatch to search agent."""
-        self._metrics.start_timer()
+        async with self._tracked_run("🧠 Orchestrator"):
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT.format(max_subtasks=cfg.MAX_SUBTASKS)),
+                HumanMessage(content=f"Research query: {query}"),
+            ]
 
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT.format(max_subtasks=cfg.MAX_SUBTASKS)),
-            HumanMessage(content=f"Research query: {query}"),
-        ]
+            callback = self.tracker.make_callback("orchestrator")
+            response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
 
-        callback = self.tracker.make_callback("orchestrator")
-        response = await self.llm.ainvoke(messages, config={"callbacks": [callback]})
+            try:
+                plan = json.loads(response.content)
+            except json.JSONDecodeError:
+                plan = {
+                    "research_goal": query,
+                    "subtasks": [{"id": 1, "query": query, "rationale": "Direct search"}],
+                }
 
-        self._metrics.stop_timer()
-
-        try:
-            plan = json.loads(response.content)
-        except json.JSONDecodeError:
-            # Fallback: treat the whole query as a single subtask
-            plan = {
-                "research_goal": query,
-                "subtasks": [{"id": 1, "query": query, "rationale": "Direct search"}],
-            }
-
-        # Dispatch A2A messages to search agent
-        for subtask in plan.get("subtasks", []):
-            msg = A2AMessage(
-                sender=self.agent_id,
-                receiver="search_agent",
-                task=TaskCard(
-                    task_type="web_search",
-                    input={
-                        "query": subtask["query"],
-                        "subtask_id": subtask["id"],
-                        "rationale": subtask.get("rationale", ""),
-                    },
-                ),
-            )
-            await self.bus.publish(msg)
+            # Dispatch A2A messages to search agent
+            for subtask in plan.get("subtasks", []):
+                msg = A2AMessage(
+                    sender=self.agent_id,
+                    receiver="search_agent",
+                    task=TaskCard(
+                        task_type="web_search",
+                        input={
+                            "query": subtask["query"],
+                            "subtask_id": subtask["id"],
+                            "rationale": subtask.get("rationale", ""),
+                        },
+                    ),
+                )
+                await self.bus.publish(msg)
 
         return plan

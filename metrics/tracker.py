@@ -7,7 +7,8 @@ Tracks per-agent:
   - Estimated cost (based on model pricing)
   - Confidence score (provided by the critic agent)
 
-All data flows into RunMetrics, which is persisted by MetricsStore.
+When an EventQueue is provided, the callback also emits LLMCallStarted /
+LLMCallFinished events for the live Streamlit activity feed.
 """
 
 from __future__ import annotations
@@ -15,10 +16,14 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
+
+if TYPE_CHECKING:
+    from events import EventQueue
 
 
 # ── Pricing table (USD per 1k tokens) ────────────────────────────────────────
@@ -32,7 +37,9 @@ COST_PER_1K: dict[str, dict[str, float]] = {
 
 
 def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    pricing = COST_PER_1K.get(model, {"prompt": 0.002, "completion": 0.002})
+    # Strip provider prefix for OpenRouter models (e.g. "openai/gpt-4o" → "gpt-4o")
+    short_model = model.split("/")[-1] if "/" in model else model
+    pricing = COST_PER_1K.get(short_model, {"prompt": 0.002, "completion": 0.002})
     return (prompt_tokens / 1000 * pricing["prompt"]) + (completion_tokens / 1000 * pricing["completion"])
 
 
@@ -110,12 +117,17 @@ class RunMetrics:
 
 
 class MetricsTracker:
-    """Tracks metrics for a single pipeline run."""
+    """Tracks metrics for a single pipeline run. Optionally emits live events."""
 
-    def __init__(self, query: str, model: str) -> None:
+    def __init__(self, query: str, model: str, event_queue: "EventQueue | None" = None) -> None:
         self.run = RunMetrics(query=query)
         self.model = model
+        self.event_queue = event_queue
         self.run.start()
+
+    def emit(self, event: Any) -> None:
+        if self.event_queue is not None:
+            self.event_queue.put(event)
 
     def agent(self, name: str) -> AgentMetrics:
         if name not in self.run.agents:
@@ -123,7 +135,12 @@ class MetricsTracker:
         return self.run.agents[name]
 
     def make_callback(self, agent_name: str) -> "LangChainMetricsCallback":
-        return LangChainMetricsCallback(metrics=self.agent(agent_name), model=self.model)
+        return LangChainMetricsCallback(
+            metrics=self.agent(agent_name),
+            model=self.model,
+            event_queue=self.event_queue,
+            agent_name=agent_name,
+        )
 
     def set_confidence(self, score: float) -> None:
         self.run.confidence_score = max(0.0, min(1.0, score))
@@ -137,24 +154,99 @@ class MetricsTracker:
 
 
 class LangChainMetricsCallback(BaseCallbackHandler):
-    """LangChain callback that populates AgentMetrics on each LLM call."""
+    """
+    LangChain callback that:
+      1. Populates AgentMetrics on each LLM call (tokens, cost, latency)
+      2. Emits LLMCallStarted / LLMCallFinished events to the EventQueue
+    """
 
-    def __init__(self, metrics: AgentMetrics, model: str) -> None:
+    def __init__(
+        self,
+        metrics: AgentMetrics,
+        model: str,
+        event_queue: "EventQueue | None" = None,
+        agent_name: str = "",
+    ) -> None:
         super().__init__()
         self.metrics = metrics
         self.model = model
+        self.event_queue = event_queue
+        self.agent_name = agent_name
+        self._llm_start_time: float = 0.0
 
-    def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
+    def _emit(self, event: Any) -> None:
+        if self.event_queue is not None:
+            self.event_queue.put(event)
+
+    # ── Chat model (ChatOpenAI, ChatAnthropic, etc.) ──────────────────────────
+
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        **kwargs: Any,
+    ) -> None:
+        from events import LLMCallStarted
         self.metrics.llm_calls += 1
         self.metrics.start_timer()
+        self._llm_start_time = time.perf_counter()
+
+        # Extract last human message as preview
+        preview = ""
+        for batch in messages:
+            for msg in reversed(batch):
+                if hasattr(msg, "content") and isinstance(msg.content, str):
+                    preview = msg.content[:120].replace("\n", " ")
+                    break
+            if preview:
+                break
+
+        self._emit(LLMCallStarted(
+            agent_name=self.agent_name,
+            model=self.model,
+            prompt_preview=preview,
+        ))
+
+    # ── Completion model fallback ─────────────────────────────────────────────
+
+    def on_llm_start(
+        self,
+        serialized: dict[str, Any],
+        prompts: list[str],
+        **kwargs: Any,
+    ) -> None:
+        from events import LLMCallStarted
+        self.metrics.llm_calls += 1
+        self.metrics.start_timer()
+        self._llm_start_time = time.perf_counter()
+
+        preview = prompts[0][:120].replace("\n", " ") if prompts else ""
+        self._emit(LLMCallStarted(
+            agent_name=self.agent_name,
+            model=self.model,
+            prompt_preview=preview,
+        ))
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
+        from events import LLMCallFinished
         self.metrics.stop_timer()
+        elapsed_ms = (time.perf_counter() - self._llm_start_time) * 1000
+
         usage = response.llm_output or {}
         token_usage = usage.get("token_usage", {})
         pt = token_usage.get("prompt_tokens", 0)
         ct = token_usage.get("completion_tokens", 0)
+
         self.metrics.prompt_tokens += pt
         self.metrics.completion_tokens += ct
         self.metrics.total_tokens += pt + ct
-        self.metrics.cost_usd += estimate_cost(self.model, pt, ct)
+        call_cost = estimate_cost(self.model, pt, ct)
+        self.metrics.cost_usd += call_cost
+
+        self._emit(LLMCallFinished(
+            agent_name=self.agent_name,
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            latency_ms=elapsed_ms,
+            cost_usd=call_cost,
+        ))
