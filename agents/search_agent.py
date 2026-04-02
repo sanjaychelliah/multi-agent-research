@@ -66,23 +66,25 @@ class SearchAgent(BaseAgent):
             query = task_input["query"]
 
             try:
-                raw = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda q=query: self.search_tool.run({"query": q})
-                )
-                results = json.loads(raw) if isinstance(raw, str) else raw
-                if isinstance(results, dict) and "error" in results:
+                raw = await self.search_tool.ainvoke({"query": query})
+                if isinstance(raw, str):
+                    parsed = json.loads(raw)
+                    results = parsed if isinstance(parsed, list) else []
+                elif isinstance(raw, list):
+                    results = raw
+                else:
                     results = []
-            except Exception as e:
+            except Exception:
                 results = []
 
             self._metrics.stop_timer()
 
             # Store in MCP memory
             mem_key = f"search_results_task_{task_input['subtask_id']}"
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda k=mem_key, v=json.dumps(results): self.memory_write_tool.run({"key": k, "value": v}),
-            )
+            try:
+                await self.memory_write_tool.ainvoke({"key": mem_key, "value": json.dumps(results)})
+            except Exception:
+                pass  # memory storage is best-effort
 
             result_payload = {
                 "subtask_id": task_input["subtask_id"],

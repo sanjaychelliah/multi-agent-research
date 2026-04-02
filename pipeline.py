@@ -24,15 +24,13 @@ Flow:
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from dataclasses import dataclass
 from typing import Any
 
+from langchain_mcp_adapters.sessions import StdioConnection
 from langchain_mcp_adapters.tools import load_mcp_tools
 from langchain_openai import ChatOpenAI
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
 from a2a import MessageBus
 from agents import CriticAgent, OrchestratorAgent, SearchAgent, SummarizerAgent
@@ -53,7 +51,7 @@ class PipelineResult:
     a2a_log: list[dict[str, Any]]
 
 
-def _build_llm() -> ChatOpenAI:
+def _build_llm():
     if cfg.LLM_PROVIDER == "anthropic":
         from langchain_anthropic import ChatAnthropic  # type: ignore
         return ChatAnthropic(model=cfg.LLM_MODEL, api_key=cfg.ANTHROPIC_API_KEY)  # type: ignore
@@ -68,45 +66,40 @@ async def run_pipeline(query: str, store: MetricsStore | None = None) -> Pipelin
     bus = MessageBus()
     llm = _build_llm()
 
-    # ── Connect to MCP Servers ────────────────────────────────────────────────
-    memory_params = StdioServerParameters(
-        command=sys.executable,
-        args=["mcp_servers/memory_server.py"],
+    # ── Connect to MCP Servers via StdioConnection ────────────────────────────
+    memory_connection: StdioConnection = {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": ["mcp_servers/memory_server.py"],
+    }
+    search_connection: StdioConnection = {
+        "transport": "stdio",
+        "command": sys.executable,
+        "args": ["mcp_servers/search_server.py"],
+    }
+
+    memory_tools = await load_mcp_tools(None, connection=memory_connection)
+    search_tools = await load_mcp_tools(None, connection=search_connection)
+
+    # Find specific tools by name
+    search_tool = next(t for t in search_tools if t.name == "web_search")
+    memory_write_tool = next(t for t in memory_tools if t.name == "memory_write")
+
+    # ── Instantiate Agents ────────────────────────────────────────────────────
+    orchestrator = OrchestratorAgent(llm=llm, tracker=tracker, bus=bus)
+    search_agent = SearchAgent(
+        llm=llm, tracker=tracker, bus=bus,
+        search_tool=search_tool,
+        memory_write_tool=memory_write_tool,
     )
-    search_params = StdioServerParameters(
-        command=sys.executable,
-        args=["mcp_servers/search_server.py"],
-    )
+    summarizer = SummarizerAgent(llm=llm, tracker=tracker, bus=bus)
+    critic = CriticAgent(llm=llm, tracker=tracker, bus=bus)
 
-    async with stdio_client(memory_params) as (mem_read, mem_write):
-        async with ClientSession(mem_read, mem_write) as mem_session:
-            await mem_session.initialize()
-            memory_tools = await load_mcp_tools(mem_session)
-
-            async with stdio_client(search_params) as (srch_read, srch_write):
-                async with ClientSession(srch_read, srch_write) as srch_session:
-                    await srch_session.initialize()
-                    search_tools = await load_mcp_tools(srch_session)
-
-                    # Find specific tools by name
-                    search_tool = next(t for t in search_tools if t.name == "web_search")
-                    memory_write_tool = next(t for t in memory_tools if t.name == "memory_write")
-
-                    # ── Instantiate Agents ────────────────────────────────────
-                    orchestrator = OrchestratorAgent(llm=llm, tracker=tracker, bus=bus)
-                    search_agent = SearchAgent(
-                        llm=llm, tracker=tracker, bus=bus,
-                        search_tool=search_tool,
-                        memory_write_tool=memory_write_tool,
-                    )
-                    summarizer = SummarizerAgent(llm=llm, tracker=tracker, bus=bus)
-                    critic = CriticAgent(llm=llm, tracker=tracker, bus=bus)
-
-                    # ── Run Pipeline ──────────────────────────────────────────
-                    plan = await orchestrator.run(query)
-                    search_results = await search_agent.run()
-                    summaries = await summarizer.run()
-                    critique_result = await critic.run()
+    # ── Run Pipeline ──────────────────────────────────────────────────────────
+    plan = await orchestrator.run(query)
+    search_results = await search_agent.run()
+    summaries = await summarizer.run()
+    critique_result = await critic.run()
 
     # ── Finalise metrics ──────────────────────────────────────────────────────
     confidence = critique_result.get("confidence_score", 0.0)
