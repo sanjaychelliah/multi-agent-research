@@ -166,6 +166,3 @@ Single responsibility: the Summarizer extracts facts, the Critic evaluates quali
 - **Swap the LLM**: change `LLM_MODEL` in `.env` — no code changes needed.
 - **Enable LangSmith**: set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY`.
 
-## License
-
-MIT
